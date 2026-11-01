@@ -1,0 +1,14 @@
+{{padRight "FAX NOTIFICATION" 40}}{{padLeft data.valueDate 40}}
+================================================================================
+{{padRight "TO:" 16}}{{recipientName}}
+{{padRight "FAX:" 16}}{{faxNumber}}
+{{padRight "REFERENCE:" 16}}{{mid}}
+--------------------------------------------------------------------------------
+{{padRight "BENEFICIARY:" 16}}{{data.beneficiaryName}}
+{{padRight "AMOUNT:" 16}}{{padLeft data.amount 20}} {{data.currency}}
+--------------------------------------------------------------------------------
+
+{{wrap data.message 80}}
+
+--------------------------------------------------------------------------------
+This is an automated notification. Please do not reply to this fax.

@@ -1,0 +1,214 @@
+# =====================================================================================================
+# fax-delivery - every value is configurable; most have safe defaults in the *Props records.
+# StartupInvariants fails the boot if values contradict each other (see DESIGN.md section 9).
+# =====================================================================================================
+spring:
+  application:
+    name: fax-delivery
+  kafka:
+    # Only Boot's own (unused) auto-configured beans read this; all fax clients use app.kafka.
+    bootstrap-servers: ${app.kafka.bootstrap-servers}
+  lifecycle:
+    timeout-per-shutdown-phase: 4m   # > consumer shutdown-timeout: in-flight record finishes and commits
+
+server:
+  port: 8080
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true                # k8s: use /actuator/health/liveness and /readiness
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} %5p [%t] [mid=%X{mid:-} origin=%X{origin:-} stage=%X{stage:-}] %logger{30} : %m%n"
+  level:
+    fax.outcome: INFO                # DEBUG also shows FILTERED and STATUS_PENDING
+    fax.circuit: INFO
+    fax.rollback: INFO
+    org.apache.kafka: WARN
+
+app:
+  # ---------------------------------------------------------------------------------------------------
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    transaction-id-prefix: fax-delivery-${HOSTNAME:local}-   # MUST be unique per pod
+    transaction-timeout: 5m
+    isolation-level: read_committed
+    properties: {}
+    #  "[security.protocol]": SASL_SSL
+    #  "[sasl.mechanism]": SCRAM-SHA-512
+    #  "[sasl.jaas.config]": ${KAFKA_JAAS_CONFIG}
+
+  topics:
+    source: ${FAX_SOURCE_TOPIC:preference-delivery}
+    retry: ${FAX_RETRY_TOPIC:fax-retry}
+    poll: ${FAX_POLL_TOPIC:fax-poll}
+
+  consumers:
+    source:
+      group-id: fax-delivery-source
+      concurrency: 1
+      max-poll-records: 1            # one SUBMIT (up to 5 RightFax calls) between polls
+      max-poll-interval: 10m
+      auto-offset-reset: latest
+      shutdown-timeout: 3m
+    retry:
+      group-id: fax-delivery-retry
+      concurrency: 3                 # >= partitions per instance (waiting for due time blocks a thread)
+      max-poll-records: 1
+      max-poll-interval: 10m
+      auto-offset-reset: earliest    # a new group must not skip already-scheduled retries
+      shutdown-timeout: 3m
+    poll:
+      group-id: fax-delivery-poll
+      concurrency: 3
+      max-poll-records: 3
+      max-poll-interval: 10m
+      auto-offset-reset: earliest    # a new group must not skip in-flight jobs
+      shutdown-timeout: 3m
+
+  headers:
+    preference: PREFERENCE
+    mid: MID
+    not-before: X-FAX-NOT-BEFORE
+    stage: X-FAX-STAGE
+    task-version: X-FAX-TASK-VERSION
+
+  filter:
+    value: FAX
+    on-retry-topic: true             # required once another flow shares the retry topic
+    on-poll-topic: true
+
+  message:                           # JSON pointers into the SOURCE payload
+    fax-number-pointer: /faxNumber
+    recipient-name-pointer: /recipientName
+    required-pointers: []            # e.g. [/data/amount, /data/beneficiaryName]
+    fax-number-pattern: "^\\+?[0-9()\\-.\\s]{7,25}$"
+
+  submit:
+    retry-delay: 60s                 # fixed delay of every retry record
+    max-age: 4h                      # BUSINESS VALUE: how late is a fax still worth sending?
+    max-unexpected: 3
+    max-retries-on-server-error: -1  # -1 = retry HTTP 500 until max-age
+
+  poll:
+    delay: 30s                       # fixed delay of every poll record
+    max-age: 2h                      # BUSINESS VALUE: give up waiting for a final status
+    max-unexpected: 3
+
+  timing:
+    due-wait-slack: 10s
+    hold-backoff: 1s
+    infra-backoff-initial: 1s
+    infra-backoff-max: 60s
+
+  circuit-breaker:
+    name: rightfax
+    failure-rate-threshold: 50
+    sliding-window-size: 10
+    minimum-number-of-calls: 5
+    wait-duration-in-open-state: 60s
+    permitted-calls-in-half-open-state: 1
+    slow-call-duration-threshold: 20s
+    slow-call-rate-threshold: 80
+    flapping-opens-per-hour: 6
+    pause-consumers-when-open: true
+
+  rightfax:
+    base-url: ${RIGHTFAX_BASE_URL:https://rightfax.example.com/RightFax/API}
+    allow-insecure-http: false       # true only for a local http stub
+    username: ${RIGHTFAX_USERNAME:}
+    password: ${RIGHTFAX_PASSWORD:}
+    # ---- VERIFY everything below against your RightFax version ----
+    login:
+      method: POST
+      path: /Login
+      style: BASIC                   # BASIC | JSON | FORM
+      username-field: username       # JSON / FORM only
+      password-field: password
+      cookie-name: rf-session
+      session-ttl:                   # empty = reuse until RightFax answers 401
+      refresh-before: 1m
+    attachments:
+      path: /Attachments
+      part-name: file
+      url-pointer: /0                # temp URL in the upload response
+    send-job:
+      path: /SendJobs
+      recipients-field: Recipients
+      recipient-name-field: Name
+      recipient-destination-field: Destination
+      attachment-urls-field: AttachmentUrls
+      mid-field:                     # e.g. BillingCode1 -> MID visible in RightFax (traces duplicates)
+      static-fields: {}              # extra fixed fields for every job
+      job-id-pointer: /Id
+    job:
+      path: /SendJobs/{jobId}
+      condition-pointer: /Condition
+      status-pointer: /Status
+      status-text-pointer: /StatusText
+    documents:
+      path: /Documents?filter=job&jobid={jobId}
+      items-pointer: /Items          # "" when the response itself is the array
+      id-field: Id
+      condition-field: Condition
+      status-field: Status
+      status-text-field: StatusText
+    conditions:
+      success: [Succeeded]
+      failure: [Failed, Canceled, Cancelled]
+    permanent-statuses: [400, 404, 409, 422]
+    http:
+      connect-timeout: 5s
+      response-timeout: 25s
+      call-timeout: 30s
+      max-connections: 10
+      max-idle-time: 30s
+      pending-acquire-timeout: 5s
+      max-in-memory-size: 4194304
+
+  document:
+    template-location: classpath:templates/GPP.txt
+    file-name-pattern: fax-{mid}.pdf
+    pdf:
+      font-location: classpath:fonts/Cousine-Regular.ttf
+      font-size: 10
+      line-spacing: 1.2
+      margin-top: 54
+      margin-bottom: 36
+      margin-left: 36
+      margin-right: 36
+      page-size: LETTER
+
+  logging:
+    masked-headers: [authorization, cookie, set-cookie]
+    max-header-value-length: 512
+    max-detail-length: 2000
+
+---
+spring:
+  config:
+    activate:
+      on-profile: json
+logging:
+  structured:
+    format:
+      console: ecs                   # JSON lines; MDC + outcome key/values become fields
+
+---
+spring:
+  config:
+    activate:
+      on-profile: local
+app:
+  rightfax:
+    base-url: http://localhost:8090/RightFax/API
+    allow-insecure-http: true
